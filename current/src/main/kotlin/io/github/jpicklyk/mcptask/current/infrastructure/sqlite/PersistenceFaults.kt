@@ -34,8 +34,19 @@ object PersistenceFaults {
     /** Retry hint on `unavailable` after a pool-checkout timeout. */
     const val POOL_RETRY_AFTER_MS = 2000L
 
-    /** True when [t] or a cause is a SQLITE_BUSY or SQLITE_LOCKED result code (the whole unit may be retried). */
+    /** True when [t] or a cause is a SQLITE_BUSY / SQLITE_LOCKED result code, or a Postgres lock/serialization SQLState (the whole unit may be retried). */
     fun isBusy(t: Throwable): Boolean = classify(t) == Fault.BUSY
+
+    /**
+     * Postgres (Forgeyn persistence lane) SQLStates that map to the BUSY fault class: serialization
+     * failure, deadlock detected, lock not available, and a too-many-connections condition — the
+     * conditions whose remedy is the same retry the SQLITE_BUSY unit deadline already performs.
+     */
+    private val POSTGRES_BUSY_SQLSTATES = setOf("40001", "40P01", "55P03", "53300")
+
+    /** Postgres unique-violation (23505) and foreign-key-violation (23503) SQLStates. */
+    private val POSTGRES_DUPLICATE_SQLSTATE = "23505"
+    private val POSTGRES_FOREIGN_KEY_SQLSTATE = "23503"
 
     /** The fault class of [t], or null when [t] is not a persistence fault. */
     fun classify(t: Throwable): Fault? {
@@ -54,14 +65,19 @@ object PersistenceFaults {
         ) {
             return Fault.BUSY
         }
+        if (causes.any { it is SQLException && it.sqlState in POSTGRES_BUSY_SQLSTATES }) return Fault.BUSY
         if (codes.any { it.startsWith("SQLITE_READONLY") }) return Fault.READONLY
         val messages = causes.mapNotNull { it.message }
         if (codes.any { it == "SQLITE_CONSTRAINT_UNIQUE" || it == "SQLITE_CONSTRAINT_PRIMARYKEY" } ||
-            messages.any { it.contains("UNIQUE constraint failed") || it.contains("PRIMARY KEY constraint failed") }
+            causes.any { it is SQLException && it.sqlState == POSTGRES_DUPLICATE_SQLSTATE } ||
+            messages.any { it.contains("UNIQUE constraint failed") || it.contains("PRIMARY KEY constraint failed") || it.contains("duplicate key value violates unique constraint") }
         ) {
             return Fault.DUPLICATE
         }
-        if (codes.any { it == "SQLITE_CONSTRAINT_FOREIGNKEY" } || messages.any { it.contains("FOREIGN KEY constraint failed") }) {
+        if (codes.any { it == "SQLITE_CONSTRAINT_FOREIGNKEY" } ||
+            causes.any { it is SQLException && it.sqlState == POSTGRES_FOREIGN_KEY_SQLSTATE } ||
+            messages.any { it.contains("FOREIGN KEY constraint failed") || it.contains("violates foreign key constraint") }
+        ) {
             return Fault.FOREIGN_KEY
         }
         return Fault.OTHER_SQL

@@ -50,6 +50,58 @@ import java.util.UUID
  * The window is a half-open text range on the canonical 23-character UTC `at` (`idx_call_log_at`); a root filter adds
  * `root_id IN (<one bound JSON id set>)` (`idx_call_log_root_at`). `day` is the first 10 characters of `at`, the UTC date.
  */
+
+/*
+ * Forgeyn Postgres persistence lane: SQLite's JSON functions in dialect-neutral form.
+ *
+ * Every helper renders the SAME semantics on both dialects:
+ *  - [jsonExtract]: a text value at a single-segment path (SQLite json_extract; Postgres #>>).
+ *  - [jsonExists]:  a JSON subtree presence test (SQLite json_extract IS NOT NULL; Postgres #>).
+ *  - [jsonTruthy]:  a JSON truthy test (SQLite `= 1`; Postgres text '1'/'true').
+ *  - [jsonEach]:    object/array expansion yielding key/value rows (SQLite json_each; Postgres
+ *                   json_each_text with a json cast).
+ *  - [jsonEachParam]: the parameter form of [jsonEach] for a bound JSON-array string.
+ *  - [unhexFn]:     a 32-hex id back to the column form (SQLite unhex; Postgres uuid cast).
+ * All are evaluated inside an active transaction, so currentDialect is definitive.
+ */
+private val reportPg: Boolean
+    get() = org.jetbrains.exposed.v1.core.vendors.currentDialect is org.jetbrains.exposed.v1.core.vendors.PostgreSQLDialect
+
+private fun jsonExtract(col: String,
+    path: String
+): String =
+    if (reportPg) "($col::json #>> '{$path}')" else "json_extract($col, '$.$path')"
+
+private fun jsonExists(col: String,
+    path: String
+): String =
+    if (reportPg) "($col::json #> '{$path}')" else "json_extract($col, '$.$path')"
+
+private fun jsonTruthy(col: String,
+    path: String
+): String =
+    if (reportPg) "($col::json #>> '{$path}') IN ('1', 'true')" else "json_extract($col, '$.$path') = 1"
+
+private fun jsonEach(col: String): String =
+    if (reportPg) "json_each_text($col::json)" else "json_each($col)"
+
+private fun jsonEachPath(col: String,
+    path: String
+): String =
+    if (reportPg) "json_each_text($col::json->'$path')" else "json_each($col, '$.$path')"
+
+private fun jsonEachParam(): String =
+    if (reportPg) "json_each_text(?::json)" else "json_each(?)"
+
+private fun jsonArrayLen(col: String,
+    path: String
+): String =
+    if (reportPg) "json_array_length($col::json->'$path')" else "json_array_length($col, '$.$path')"
+
+private fun unhexFn(expr: String): String =
+    if (reportPg) "($expr::uuid)" else "unhex($expr)"
+
+
 class SqliteReportQueries(
     private val databaseManager: DatabaseManager
 ) : ReportQueries {
@@ -139,16 +191,16 @@ class SqliteReportQueries(
                     scopeRootIds = query.scopeRootIds,
                     scopeTags = query.scopeTags,
                     rootId = query.rootId,
-                    extra = if (gateOnly) "json_extract(e.data, '$.code') = '${DomainEvent.REJECTED_GATE_BLOCKED}'" else null
+                    extra = if (gateOnly) "${jsonExtract("e.data", "code")} = '${DomainEvent.REJECTED_GATE_BLOCKED}'" else null
                 )
             // One row per (rejection, group value) in x; a rejection with no value for the dimension has a NULL k. blocks
             // counts distinct rejections, items distinct item ids.
             val x =
                 when (query.groupBy) {
                     GateDimension.NOTE_KEY ->
-                        "SELECT DISTINCT ev.seq AS seq, ev.eid AS eid, j.value AS k FROM ev, json_each(ev.data, '$.missingKeys') j " +
+                        "SELECT DISTINCT ev.seq AS seq, ev.eid AS eid, j.value AS k FROM ev, ${jsonEachPath("ev.data", "missingKeys")} j " +
                             "UNION ALL SELECT ev.seq, ev.eid, NULL FROM ev " +
-                            "WHERE COALESCE(json_array_length(ev.data, '$.missingKeys'), 0) = 0"
+                            "WHERE COALESCE(${jsonArrayLen("ev.data", "missingKeys")}, 0) = 0"
                     GateDimension.TYPE ->
                         "SELECT ev.seq AS seq, ev.eid AS eid, w.type AS k FROM ev LEFT JOIN work_items w ON w.id = ev.eid"
                     GateDimension.TRAIT ->
@@ -156,7 +208,7 @@ class SqliteReportQueries(
                             "UNION ALL SELECT ev.seq, ev.eid, NULL FROM ev " +
                             "WHERE NOT EXISTS (SELECT 1 FROM item_traits t WHERE t.item_id = ev.eid)"
                     GateDimension.ERROR_CODE ->
-                        "SELECT ev.seq AS seq, ev.eid AS eid, json_extract(ev.data, '$.code') AS k FROM ev"
+                        "SELECT ev.seq AS seq, ev.eid AS eid, ${jsonExtract("ev.data", "code")} AS k FROM ev"
                 }
             selectSql(
                 "WITH ev AS MATERIALIZED (SELECT e.seq AS seq, e.entity_id AS eid, e.data AS data FROM ${eventSource(query.scopeTags)} " +
@@ -198,13 +250,13 @@ class SqliteReportQueries(
             // e expired, l released, f force-released (lease.released with forced true).
             val x =
                 "SELECT CASE WHEN ev.t LIKE 'lease.%' THEN 'lease' ELSE 'claim' END AS kind, " +
-                    "CASE WHEN ev.t LIKE 'lease.%' THEN json_extract(ev.data, '$.key') ELSE $claimId END AS res, " +
+                    "CASE WHEN ev.t LIKE 'lease.%' THEN ${jsonExtract("ev.data", "key")} ELSE $claimId END AS res, " +
                     "CASE ev.t WHEN 'lease.acquired' THEN 'a' WHEN 'claim.acquired' THEN 'a' WHEN 'claim.rejected' THEN 'r' " +
                     "WHEN 'lease.expired' THEN 'e' WHEN 'claim.expired' THEN 'e' WHEN 'claim.released' THEN 'l' " +
-                    "WHEN 'lease.released' THEN CASE WHEN json_extract(ev.data, '$.forced') = 1 THEN 'f' ELSE 'l' END END AS m " +
+                    "WHEN 'lease.released' THEN CASE WHEN ${jsonTruthy("ev.data", "forced")} THEN 'f' ELSE 'l' END END AS m " +
                     "FROM ev WHERE ev.t <> 'lease.rejected' " +
                     "UNION ALL SELECT 'lease', res, 'r' FROM (SELECT DISTINCT ev.seq AS s, j.value AS res " +
-                    "FROM ev, json_each(ev.data, '$.contendedKeys') j WHERE ev.t = 'lease.rejected')"
+                    "FROM ev, ${jsonEachPath("ev.data", "contendedKeys")} j WHERE ev.t = 'lease.rejected')"
             selectSql(
                 "WITH ev AS MATERIALIZED (SELECT e.seq AS seq, e.type AS t, e.entity_id AS eid, e.data AS data " +
                     "FROM ${eventSource(query.scopeTags)} WHERE $where), x AS ($x), " +
@@ -267,34 +319,34 @@ class SqliteReportQueries(
             selectSql(
                 "WITH w AS MATERIALIZED (SELECT at, session_id, outcome, target_ids, target_versions, request_shape, " +
                     "result_count, eligible_count, replayed, lifecycle_free_rejections, hit_signals, " +
-                    "(tool IN (SELECT value FROM json_each(?))) AS is_read, " +
-                    "(tool IN (SELECT value FROM json_each(?))) AS is_write, " +
+                    "(tool IN (SELECT value FROM ${jsonEachParam()})) AS is_read, " +
+                    "(tool IN (SELECT value FROM ${jsonEachParam()})) AS is_write, " +
                     "(surface = ? AND session_id IS NOT NULL) AS is_session, " +
                     "(tool = ?) AS is_items_read, " +
-                    "(COALESCE(operation, '') IN (SELECT value FROM json_each(?))) AS is_hit_list, " +
-                    "(COALESCE(operation, '') IN (SELECT value FROM json_each(?))) AS is_fetch, " +
+                    "(COALESCE(operation, '') IN (SELECT value FROM ${jsonEachParam()})) AS is_hit_list, " +
+                    "(COALESCE(operation, '') IN (SELECT value FROM ${jsonEachParam()})) AS is_fetch, " +
                     "(COALESCE(operation, '') = ?) AS is_next, " +
                     "(COALESCE(operation, '') = ?) AS is_related " +
                     "FROM call_log WHERE $where), " +
                     "obs AS MATERIALIZED (SELECT w.session_id AS s, j.key AS k, j.value AS v " +
-                    "FROM w, json_each(w.target_versions) j " +
+                    "FROM w, ${jsonEach("w.target_versions")} j " +
                     "WHERE w.is_read AND w.is_session AND w.outcome = 'ok' AND NOT w.is_hit_list " +
                     "AND w.target_versions IS NOT NULL), " +
                     "lw AS (SELECT session_id AS s, MAX(at) AS last_write FROM w WHERE w.is_write AND w.is_session " +
                     "GROUP BY session_id), " +
-                    "units AS (SELECT r.session_id AS s, r.at AS at, json_extract(h.value, '$.id') AS id, sg.value AS sig " +
-                    "FROM w r, json_each(r.hit_signals) h, json_each(h.value, '$.signals') sg " +
+                    "units AS (SELECT r.session_id AS s, r.at AS at, ${jsonExtract("h.value", "id")} AS id, sg.value AS sig " +
+                    "FROM w r, ${jsonEach("r.hit_signals")} h, ${jsonEachPath("h.value", "signals")} sg " +
                     "WHERE r.is_items_read AND r.is_related AND r.is_session AND r.outcome = 'ok' AND r.hit_signals IS NOT NULL), " +
-                    "named AS (SELECT c.session_id AS s, t.value AS id, c.at AS at FROM w c, json_each(c.target_ids) t " +
+                    "named AS (SELECT c.session_id AS s, t.value AS id, c.at AS at FROM w c, ${jsonEach("c.target_ids")} t " +
                     "WHERE c.is_session AND NOT c.is_hit_list AND c.target_ids IS NOT NULL " +
-                    "UNION ALL SELECT c.session_id, t.key, c.at FROM w c, json_each(c.target_versions) t " +
+                    "UNION ALL SELECT c.session_id, t.key, c.at FROM w c, ${jsonEach("c.target_versions")} t " +
                     "WHERE c.is_session AND NOT c.is_hit_list AND c.target_versions IS NOT NULL), " +
                     "tmax AS (SELECT s, id, MAX(at) AS last_at FROM named GROUP BY s, id) " +
                     "SELECT 'redundantReads' AS m, " +
                     "(SELECT COUNT(*) FROM obs) - (SELECT COUNT(*) FROM (SELECT DISTINCT s, k, v FROM obs)) AS num, " +
                     "(SELECT COUNT(*) FROM obs) AS den " +
                     "UNION ALL SELECT 'overFetch', " +
-                    "COALESCE(SUM(CASE WHEN json_extract(request_shape, '$.fields') IS NOT NULL THEN 1 ELSE 0 END), 0), COUNT(*) " +
+                    "COALESCE(SUM(CASE WHEN ${jsonExists("request_shape", "fields")} IS NOT NULL THEN 1 ELSE 0 END), 0), COUNT(*) " +
                     "FROM w WHERE is_items_read AND is_fetch AND outcome = 'ok' " +
                     "UNION ALL SELECT 'readsWithoutLaterWrite', " +
                     "COALESCE(SUM(CASE WHEN lw.last_write IS NULL OR lw.last_write <= r.at THEN 1 ELSE 0 END), 0), COUNT(*) " +
@@ -390,7 +442,7 @@ class SqliteReportQueries(
             val scopeSql = StringBuilder()
             val scopeArgs = ArrayList<Pair<IColumnType<*>, Any?>>()
             query.scopeRootIds?.let { roots ->
-                scopeSql.append(" AND c.root_id IN (${WorkViewSql.ID_SET_SELECT})")
+                scopeSql.append(" AND c.root_id IN (${WorkViewSql.idSetSelect()})")
                 scopeArgs += WorkViewSql.idSetArgument(roots)
             }
             val scope = scopeSql.toString()
@@ -420,9 +472,9 @@ class SqliteReportQueries(
                     "ev AS MATERIALIZED (SELECT e.type AS t, e.req_id AS req, e.data AS data FROM events e " +
                     "WHERE e.entity_id IN (SELECT id FROM ents) AND e.occurred_at >= ? AND e.occurred_at < ?), " +
                     "tids AS MATERIALIZED (SELECT $tid AS tid FROM sub), " +
-                    "hits AS (SELECT c.req_id AS rid FROM call_log c, json_each(c.target_ids) j " +
+                    "hits AS (SELECT c.req_id AS rid FROM call_log c, ${jsonEach("c.target_ids")} j " +
                     "WHERE c.root_id = unhex(?) AND c.at >= ? AND c.at < ? AND $targetMatch$scope " +
-                    "UNION SELECT c.req_id FROM call_log c, json_each(c.target_ids) j " +
+                    "UNION SELECT c.req_id FROM call_log c, ${jsonEach("c.target_ids")} j " +
                     "WHERE c.root_id IS NULL AND c.at >= ? AND c.at < ? AND $targetMatch$scope " +
                     "UNION SELECT c.req_id FROM call_log c " +
                     "WHERE c.req_id IN (SELECT req FROM ev WHERE req IS NOT NULL) AND c.at >= ? AND c.at < ?$scope) " +
@@ -430,7 +482,7 @@ class SqliteReportQueries(
                     "WHERE w.id IN (SELECT id FROM sub) AND w.role IS NOT NULL GROUP BY w.role " +
                     "UNION ALL SELECT 'events', NULL, " +
                     "COALESCE(SUM(t = '${DomainEvent.ITEM_TRANSITIONED}'), 0), " +
-                    "COALESCE(SUM(t = '${DomainEvent.ITEM_TRANSITIONED}' AND json_extract(data, '$.origin') = '$CASCADE'), 0), " +
+                    "COALESCE(SUM(t = '${DomainEvent.ITEM_TRANSITIONED}' AND ${jsonExtract("data", "origin")} = '$CASCADE'), 0), " +
                     "COALESCE(SUM(t = '${DomainEvent.TRANSITION_REJECTED}'), 0), " +
                     "COALESCE(SUM(t = '${DomainEvent.NOTE_UPSERTED}'), 0), 0 FROM ev " +
                     "UNION ALL SELECT 'cost', NULL, COUNT(*), COALESCE(SUM(outcome = 'error'), 0), " +
@@ -489,7 +541,7 @@ class SqliteReportQueries(
             var cost = LongArray(FIGURES)
             val dwell = LinkedHashMap<String, Long>()
             selectSql(
-                "WITH mem AS MATERIALIZED (SELECT unhex(value) AS id FROM json_each(?)), " +
+                "WITH mem AS MATERIALIZED (SELECT ${unhexFn("value")} AS id FROM ${jsonEachParam()}), " +
                     "ev AS MATERIALIZED (SELECT e.type AS t, e.data AS data FROM events e WHERE e.run_id = unhex(?)), " +
                     "tr AS MATERIALIZED (SELECT e.entity_id AS eid, e.seq AS seq, e.occurred_at AS at, e.data AS data " +
                     "FROM mem CROSS JOIN events e WHERE e.entity_id = mem.id AND +e.type = $transitioned " +
@@ -497,14 +549,14 @@ class SqliteReportQueries(
                     "UNION ALL SELECT e.entity_id, e.seq, e.occurred_at, e.data FROM mem CROSS JOIN events e " +
                     "WHERE e.entity_id = mem.id AND e.seq = (SELECT MAX(p.seq) FROM events p " +
                     "WHERE p.entity_id = mem.id AND +p.type = $transitioned AND +p.occurred_at < ?)), " +
-                    "iv AS (SELECT json_extract(data, '$.toRole') AS role, json_extract(data, '$.blockedReason') AS reason, " +
+                    "iv AS (SELECT ${jsonExtract("data", "toRole")} AS role, ${jsonExtract("data", "blockedReason")} AS reason, " +
                     "at, LEAD(at) OVER (PARTITION BY eid ORDER BY seq) AS nxt FROM tr) " +
                     "SELECT 'role' AS m, w.role AS k, COUNT(*) AS n1, 0 AS n2, 0 AS n3, 0 AS n4, 0 AS n5, " +
                     "NULL AS a, NULL AS b FROM work_items w " +
                     "WHERE w.id IN (SELECT id FROM mem) AND w.role IS NOT NULL GROUP BY w.role " +
                     "UNION ALL SELECT 'events', NULL, " +
                     "COALESCE(SUM(t = $transitioned), 0), " +
-                    "COALESCE(SUM(t = $transitioned AND json_extract(data, '$.origin') = '$CASCADE'), 0), " +
+                    "COALESCE(SUM(t = $transitioned AND ${jsonExtract("data", "origin")} = '$CASCADE'), 0), " +
                     "COALESCE(SUM(t = '${DomainEvent.TRANSITION_REJECTED}'), 0), " +
                     "COALESCE(SUM(t = '${DomainEvent.NOTE_UPSERTED}'), 0), 0, NULL, NULL FROM ev " +
                     "UNION ALL SELECT 'cost', NULL, COUNT(*), COALESCE(SUM(outcome = 'error'), 0), " +
@@ -549,7 +601,7 @@ class SqliteReportQueries(
     override suspend fun runEndedRollup(runId: UUID): String? =
         databaseManager.readTx {
             selectSql(
-                "SELECT json_extract(data, '$.rollup') FROM events WHERE entity_id = unhex(?) " +
+                "SELECT ${jsonExtract("data", "rollup")} FROM events WHERE entity_id = ${unhexFn("?")} " +
                     "AND type = '${DomainEvent.RUN_ENDED}' ORDER BY seq DESC LIMIT 1",
                 listOf(TextColumnType() to hex(runId))
             ) { rs -> listOfNotNull(if (rs.next()) rs.getString(1) else null) }.firstOrNull()
@@ -590,11 +642,11 @@ class SqliteReportQueries(
         val sql = StringBuilder()
         val args = ArrayList<Pair<IColumnType<*>, Any?>>()
         scopeRootIds?.let { roots ->
-            sql.append(" AND $column IN (${WorkViewSql.ID_SET_SELECT})")
+            sql.append(" AND $column IN (${WorkViewSql.idSetSelect()})")
             args += WorkViewSql.idSetArgument(roots)
         }
         rootId?.let { root ->
-            sql.append(" AND $column IN (${WorkViewSql.ID_SET_SELECT})")
+            sql.append(" AND $column IN (${WorkViewSql.idSetSelect()})")
             args += WorkViewSql.idSetArgument(listOf(root))
         }
         return sql.toString() to args
@@ -716,11 +768,11 @@ class SqliteReportQueries(
         args += TextColumnType() to UtcTimestamp.format(until)
         extra?.let { clauses += it }
         scopeRootIds?.let { roots ->
-            clauses += "e.root_id IN (${WorkViewSql.ID_SET_SELECT})"
+            clauses += "e.root_id IN (${WorkViewSql.idSetSelect()})"
             args += WorkViewSql.idSetArgument(roots)
         }
         rootId?.let { root ->
-            clauses += "e.root_id IN (${WorkViewSql.ID_SET_SELECT})"
+            clauses += "e.root_id IN (${WorkViewSql.idSetSelect()})"
             args += WorkViewSql.idSetArgument(listOf(root))
         }
         if (scopeTags.isNotEmpty()) {

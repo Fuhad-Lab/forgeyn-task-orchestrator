@@ -1,11 +1,14 @@
 package io.github.jpicklyk.mcptask.current.infrastructure.sqlite.schema.management
 
 import io.github.jpicklyk.mcptask.current.infrastructure.config.FtsIntegrityMode
+import io.github.jpicklyk.mcptask.current.infrastructure.sqlite.DbDialect
 import io.github.jpicklyk.mcptask.current.infrastructure.sqlite.StartupIntegrity
+import io.github.jpicklyk.mcptask.current.infrastructure.sqlite.StartupIntegrityException
 import org.flywaydb.core.Flyway
 import org.flywaydb.core.api.FlywayException
 import org.flywaydb.core.api.configuration.FluentConfiguration
 import org.flywaydb.core.api.output.MigrateResult
+import org.postgresql.ds.PGSimpleDataSource
 import org.slf4j.LoggerFactory
 import org.sqlite.SQLiteConfig
 import org.sqlite.SQLiteDataSource
@@ -15,6 +18,7 @@ import java.sql.Connection
 import java.sql.DriverManager
 import java.sql.SQLException
 import java.util.UUID
+import javax.sql.DataSource
 
 /**
  * The schema manager: Flyway versioned migrations are the only schema path.
@@ -79,7 +83,10 @@ class FlywayDatabaseSchemaManager(
             Flyway
                 .configure()
                 .dataSource(flywayDataSource(url))
-                .locations(MIGRATION_LOCATION)
+                // Forgeyn Postgres persistence lane: a jdbc:postgresql: URL loads the Postgres
+                // migration set (db/migration/postgres — one consolidated baseline reproducing the
+                // V1..V37 final state in Postgres DDL); SQLite URLs keep the upstream location.
+                .locations(migrationLocation(url))
                 .validateMigrationNaming(true)
                 .cleanDisabled(true)
                 .callbacks(RoleTransitionBackfillCallback())
@@ -87,6 +94,13 @@ class FlywayDatabaseSchemaManager(
         if (target != null) config.target(target)
         return config
     }
+
+    /**
+     * The migration classpath location for [url]'s dialect: the Postgres baseline set for
+     * `jdbc:postgresql:` URLs, the upstream SQLite set for everything else.
+     */
+    internal fun migrationLocation(url: String): String =
+        if (DbDialect.of(url) == DbDialect.POSTGRES) POSTGRES_MIGRATION_LOCATION else MIGRATION_LOCATION
 
     /**
      * Flyway's dedicated SQLite DataSource (the application connection is never reused).
@@ -101,13 +115,19 @@ class FlywayDatabaseSchemaManager(
      * connection runs with it OFF. V9 stays byte-identical because Flyway checksums comment lines, so
      * the correction lives here and in the migration-review skill.
      */
-    private fun flywayDataSource(url: String): SQLiteDataSource =
-        SQLiteDataSource(
-            SQLiteConfig().apply {
-                enforceForeignKeys(false)
-                setBusyTimeout(busyTimeoutMs.toInt())
-            }
-        ).also { it.url = url }
+    private fun flywayDataSource(url: String): DataSource =
+        // Forgeyn Postgres persistence lane: a plain pgjdbc DataSource over the URL itself —
+        // credentials and sslmode ride the URL query exactly as they do for the application pools.
+        if (DbDialect.of(url) == DbDialect.POSTGRES) {
+            PGSimpleDataSource().also { it.setURL(url) }
+        } else {
+            SQLiteDataSource(
+                SQLiteConfig().apply {
+                    enforceForeignKeys(false)
+                    setBusyTimeout(busyTimeoutMs.toInt())
+                }
+            ).also { it.url = url }
+        }
 
     override fun updateSchema(): Boolean {
         return try {
@@ -127,7 +147,10 @@ class FlywayDatabaseSchemaManager(
 
     /** Direct-mode handling, then repair / validate / migrate. Returns false after logging on refusal. */
     private fun applySchemaPhase(): Boolean {
-        if (!handleDirectModeDatabase()) return false
+        // Forgeyn Postgres persistence lane: the Direct-mode reconciliation is a SQLite-file concept
+        // (a pre-Flyway database). A Postgres schema is either empty (fresh migrate) or carries
+        // flyway_schema_history; a dirty non-history schema fails Flyway validation closed.
+        if (DbDialect.of(jdbcUrl) != DbDialect.POSTGRES && !handleDirectModeDatabase()) return false
 
         if (repair) {
             logger.info("FLYWAY_REPAIR=true detected, running repair...")
@@ -297,6 +320,44 @@ class FlywayDatabaseSchemaManager(
 
     /** Runs the inventory, FTS integrity check and drift reports on one short-lived connection. */
     private fun runIntegrity() {
+        if (DbDialect.of(jdbcUrl) == DbDialect.POSTGRES) {
+            // Forgeyn Postgres persistence lane: the FTS5 inventory/integrity check is SQLite-specific.
+            // Postgres keeps the same fail-closed boot property through a core-table inventory
+            // assertion; the search structures themselves are native Postgres objects created by the
+            // baseline migration and covered by Flyway validation.
+            try {
+                // An explicit DataSource, never DriverManager: the fat-jar merge deduplicates
+                // META-INF/services/java.sql.Driver, so the driver registration the DriverManager
+                // path depends on cannot be relied on (the same law as DatabaseManager's pools).
+                val probe = PGSimpleDataSource()
+                probe.setURL(jdbcUrl)
+                probe.getConnection().use { conn ->
+                    conn.createStatement().use { st ->
+                        st.executeQuery(
+                            "SELECT count(*) FROM information_schema.tables " +
+                                "WHERE table_schema = current_schema() " +
+                                "AND table_name IN ('work_items','notes','dependencies','events','documents','runs')"
+                        ).use { rs ->
+                            if (rs.next() && rs.getInt(1) < 6) {
+                                logger.error(
+                                    "Postgres schema inventory check failed: {}/6 core tables visible. " +
+                                        "The migrations did not complete; refusing to serve.",
+                                    rs.getInt(1)
+                                )
+                                throw StartupIntegrityException(
+                                    "Postgres schema inventory check failed"
+                                )
+                            }
+                        }
+                    }
+                }
+            } catch (e: StartupIntegrityException) {
+                throw e
+            } catch (e: Exception) {
+                logger.warn("Postgres schema inventory check could not run: ${e.message}")
+            }
+            return
+        }
         val config = SQLiteConfig().apply { setBusyTimeout(busyTimeoutMs.toInt()) }
         DriverManager.getConnection(jdbcUrl, config.toProperties()).use { StartupIntegrity.run(it, ftsIntegrity) }
     }
@@ -323,8 +384,11 @@ class FlywayDatabaseSchemaManager(
     private fun <T> withMigrationLock(block: () -> T): T = MigrationLock.withLock(jdbcUrl, lockTimeoutMs, lockAttempt, block)
 
     companion object {
-        /** The only configured migration location. */
+        /** The only configured migration location for SQLite URLs. */
         const val MIGRATION_LOCATION = "classpath:db/migration/sqlite"
+
+        /** Forgeyn Postgres persistence lane: the migration location for `jdbc:postgresql:` URLs. */
+        const val POSTGRES_MIGRATION_LOCATION = "classpath:db/migration/postgres"
         internal const val HISTORY_TABLE = "flyway_schema_history"
         internal const val LOCK_TIMEOUT_MS = 300_000L
         private const val BUSY_RETRIES = 3

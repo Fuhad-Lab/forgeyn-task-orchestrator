@@ -63,7 +63,7 @@ class PinBackfillStep(
     )
 
     private class Pin(
-        val rowId: Long,
+        val rowId: Any,
         val server: UUID?,
         val root: UUID?,
         val key: String?,
@@ -73,6 +73,11 @@ class PinBackfillStep(
 
     override suspend fun run(scope: WriteScope): Int {
         val tx = TransactionManager.current()
+        // Forgeyn Postgres persistence lane: the backfill fragments are dialect-aware (BackfillSql).
+        val pg = BackfillSql.postgres()
+        val rootKey = BackfillSql.uuidKey("h.root_id", pg)
+        val rootKey2 = BackfillSql.uuidKey("root_id", pg)
+        val rowCol = BackfillSql.rowColumn(pg)
         val uuidType = UUIDColumnType()
 
         var server: Head? = null
@@ -91,7 +96,7 @@ class PinBackfillStep(
 
         val roots = HashMap<String, Head>()
         tx.exec(
-            "SELECT lower(hex(h.root_id)) AS root, v.id AS vid, v.yaml AS config_yaml FROM config_heads h " +
+            "SELECT $rootKey AS root, v.id AS vid, v.yaml AS config_yaml FROM config_heads h " +
                 "JOIN config_versions v ON v.id = h.version_id WHERE h.scope = 'root' AND v.source <> 'reset'"
         ) { rs ->
             while (rs.next()) {
@@ -106,7 +111,7 @@ class PinBackfillStep(
         }
 
         val pins = mutableListOf<Pin>()
-        tx.exec("SELECT rowid AS rid, lower(hex(root_id)) AS root, type FROM work_items WHERE pinned_at IS NULL") { rs ->
+        tx.exec("SELECT $rowCol AS rid, $rootKey2 AS root, type FROM work_items WHERE pinned_at IS NULL") { rs ->
             while (rs.next()) {
                 val root = rs.getString("root")?.let { roots[it] }
                 val type = rs.getString("type")
@@ -120,7 +125,7 @@ class PinBackfillStep(
                         ?.let { SchemaFacts.roleBearing(it) }
                 pins +=
                     Pin(
-                        rowId = rs.getLong("rid"),
+                        rowId = if (pg) rs.getObject("rid")!! else rs.getLong("rid"),
                         server = server?.versionId,
                         root = root?.versionId,
                         key = resolved?.key,
@@ -132,7 +137,8 @@ class PinBackfillStep(
 
         val pinnedAt = UtcTimestamp.format(scope.now)
         val textType = TextColumnType()
-        val rowType = LongColumnType()
+        val rowType: org.jetbrains.exposed.v1.core.ColumnType<*> =
+            if (pg) org.jetbrains.exposed.v1.core.java.UUIDColumnType() else LongColumnType()
         for (pin in pins) {
             // NULLs are written as literals (a typed bind of null needs a nullable column type).
             val args = ArrayList<Pair<ColumnType<*>, Any?>>()
@@ -153,7 +159,7 @@ class PinBackfillStep(
                     "pinned_schema_key = ${slot(textType, pin.key)}, " +
                     "pinned_schema_layer = ${slot(textType, pin.layer?.wire)}, " +
                     "lifecycle = ${slot(textType, pin.lifecycle?.name?.lowercase())}, " +
-                    "pinned_at = ${slot(textType, pinnedAt)} WHERE rowid = ${slot(rowType, pin.rowId)}"
+                    "pinned_at = ${slot(textType, pinnedAt)} WHERE $rowCol = ${slot(rowType, pin.rowId)}"
             tx.exec(sql, args = args)
         }
         logger.info("pin-backfill: pinned {} item(s) ({} schema-free)", pins.size, pins.count { it.key == null })

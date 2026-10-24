@@ -484,7 +484,7 @@ class SqliteItemStore(
             val sql =
                 """
                 WITH RECURSIVE walk(top, id) AS (
-                    SELECT id, id FROM work_items WHERE id IN (${WorkViewSql.ID_SET_SELECT})
+                    SELECT id, id FROM work_items WHERE id IN (${WorkViewSql.idSetSelect()})
                     UNION
                     SELECT w.top, x.id FROM work_items x JOIN walk w ON x.parent_id = w.id
                 )
@@ -549,7 +549,7 @@ class SqliteItemStore(
             val sql =
                 """
                 WITH RECURSIVE walk(top, id) AS (
-                    SELECT id, id FROM work_items WHERE id IN (${WorkViewSql.ID_SET_SELECT})
+                    SELECT id, id FROM work_items WHERE id IN (${WorkViewSql.idSetSelect()})
                     UNION
                     SELECT w.top, x.id FROM work_items x JOIN walk w ON x.parent_id = w.id
                 )

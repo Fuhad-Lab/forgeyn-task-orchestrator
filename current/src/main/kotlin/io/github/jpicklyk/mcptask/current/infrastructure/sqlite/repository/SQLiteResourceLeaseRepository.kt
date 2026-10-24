@@ -51,6 +51,20 @@ class SQLiteResourceLeaseRepository(
     private val clock: Clock = SystemClock
 ) : LeaseStore {
     /**
+     * Forgeyn Postgres persistence lane: the DB-side id default for the raw acquire upsert.
+     * SQLite's `randomblob(16)` becomes Postgres's native `gen_random_uuid()`; both are the same
+     * 16-byte random id the Flyway DDL declares as the column's DEFAULT on their dialect.
+     */
+    private val idDefaultExpression: String =
+        if (databaseManager.isPostgres) "gen_random_uuid()" else "randomblob(16)"
+
+    /**
+     * Forgeyn Postgres persistence lane: the 2-argument scalar minimum. SQLite spells it `min(a, b)`;
+     * Postgres's `min` is aggregate-only and the scalar form is `LEAST(a, b)`.
+     */
+    private fun leastFn(): String = if (databaseManager.isPostgres) "LEAST" else "min"
+
+    /**
      * v1 hard cap on concurrent active holders per resource key. Matches
      * [io.github.jpicklyk.mcptask.current.domain.model.ResourceDefinition.maxHolders]'s own
      * config-load-time hard cap (a config value > 1 is rejected as a load ERROR — see that
@@ -188,7 +202,7 @@ class SQLiteResourceLeaseRepository(
                                 (id, resource_key, holder_item_id, acquired_by_actor_id,
                                  acquired_at, expires_at, original_acquired_at, version)
                             VALUES
-                                (randomblob(16), ?, ?, ?, ?, ?, ?, 0)
+                                ($idDefaultExpression, ?, ?, ?, ?, ?, ?, 0)
                             ON CONFLICT(resource_key, holder_item_id) DO UPDATE SET
                                 acquired_by_actor_id = excluded.acquired_by_actor_id,
                                 acquired_at = excluded.acquired_at,
@@ -317,7 +331,7 @@ class SQLiteResourceLeaseRepository(
             exec(
                 """
                 UPDATE resource_lease_history
-                   SET released_at = min(?, expires_at),
+                   SET released_at = ${leastFn()}(?, expires_at),
                        release_reason = CASE WHEN expires_at <= ? THEN 'expired' ELSE 'released' END
                  WHERE holder_item_id = ? AND released_at IS NULL
                 """.trimIndent(),
@@ -344,7 +358,7 @@ class SQLiteResourceLeaseRepository(
                 exec(
                     """
                     UPDATE resource_lease_history
-                       SET released_at = min(?, expires_at),
+                       SET released_at = ${leastFn()}(?, expires_at),
                            release_reason = CASE WHEN expires_at <= ? THEN 'expired' ELSE 'released' END
                      WHERE holder_item_id IN ($placeholders) AND released_at IS NULL
                     """.trimIndent(),
@@ -371,7 +385,7 @@ class SQLiteResourceLeaseRepository(
             exec(
                 """
                 UPDATE resource_lease_history
-                   SET released_at = min(?, expires_at),
+                   SET released_at = ${leastFn()}(?, expires_at),
                        release_reason = CASE WHEN expires_at <= ? THEN 'expired' ELSE 'force_released' END,
                        released_by_actor_id = ?
                  WHERE resource_key = ? AND released_at IS NULL

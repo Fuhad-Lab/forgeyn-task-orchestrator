@@ -14,6 +14,7 @@ import org.jetbrains.exposed.v1.core.DatabaseConfig
 import org.jetbrains.exposed.v1.jdbc.Database
 import org.jetbrains.exposed.v1.jdbc.transactions.TransactionManager
 import org.slf4j.LoggerFactory
+import org.postgresql.ds.PGSimpleDataSource
 import org.sqlite.SQLiteConfig
 import org.sqlite.SQLiteDataSource
 import java.io.File
@@ -63,6 +64,14 @@ class DatabaseManager(
     private var jdbcUrl: String? = null
     private lateinit var schemaManager: DatabaseSchemaManager
 
+    /**
+     * Forgeyn Postgres persistence lane: true when this manager was initialized (or, before that,
+     * is configured) against a `jdbc:postgresql:` DATABASE_PATH. Read by the few repository-level
+     * dialect branches (raw SQL id defaults); everything coarser branches through [DbDialect].
+     */
+    val isPostgres: Boolean
+        get() = jdbcUrl?.let { DbDialect.of(it) == DbDialect.POSTGRES } ?: false
+
     /** Runs units of work: the writer Mutex, BUSY retry, boundary translation and the outside-unit write counter. */
     val units: UnitRunner = UnitRunner(this, outsideUnitPolicy)
 
@@ -83,7 +92,11 @@ class DatabaseManager(
         try {
             logger.info("Initializing database at: $databasePath")
 
-            if (databasePath.contains("mode=memory") || databasePath.contains(":memory:")) {
+            // Forgeyn Postgres persistence lane: a jdbc:postgresql: URL selects the Postgres pools and
+            // Postgres-appropriate isolation directly; the SQLite guards below it do not apply to it.
+            val dialect = DbDialect.of(databasePath)
+
+            if (dialect == DbDialect.SQLITE && (databasePath.contains("mode=memory") || databasePath.contains(":memory:"))) {
                 logger.error(
                     "In-memory SQLite databases are not supported: the writer and reader pools would open two " +
                         "different databases. Use a file-backed database. Refusing: $databasePath"
@@ -115,21 +128,35 @@ class DatabaseManager(
 
             // The isolation level is per Database. defaultMaxAttempts = 1: Exposed would otherwise retry any
             // SQLException up to 3 times and re-run the block without resetting unit hooks or the ConfigSession;
-            // UnitRunner owns retry.
+            // UnitRunner owns retry. Postgres runs READ_COMMITTED: writes are already strictly serialized by the
+            // single writer connection plus the in-process writer mutex (the SQLite IMMEDIATE discipline's
+            // equivalent), and SERIALIZABLE readers would only add serialization-abort retry loops on Postgres.
             val config =
                 DatabaseConfig {
-                    defaultIsolationLevel = Connection.TRANSACTION_SERIALIZABLE
+                    defaultIsolationLevel =
+                        if (dialect == DbDialect.POSTGRES) {
+                            Connection.TRANSACTION_READ_COMMITTED
+                        } else {
+                            Connection.TRANSACTION_SERIALIZABLE
+                        }
                     defaultMaxAttempts = 1
                 }
             writerDb = Database.connect(datasource = writerSource, databaseConfig = config)
             readerDb = Database.connect(datasource = readerSource, databaseConfig = config)
             jdbcUrl = url
 
-            logger.info(
-                "Database pools established (writer: 1 connection, IMMEDIATE; reader: $readerSize connections, " +
-                    "DEFERRED, query_only; pool busy_timeout $POOL_BUSY_TIMEOUT_MS ms; " +
-                    "Flyway/compaction busy_timeout $busyTimeoutMs ms)"
-            )
+            if (dialect == DbDialect.POSTGRES) {
+                logger.info(
+                    "Postgres pools established (writer: 1 connection, in-process mutex serialized; " +
+                        "reader: $readerSize connections, READ_COMMITTED; dialect: Supabase Postgres persistence lane)"
+                )
+            } else {
+                logger.info(
+                    "Database pools established (writer: 1 connection, IMMEDIATE; reader: $readerSize connections, " +
+                        "DEFERRED, query_only; pool busy_timeout $POOL_BUSY_TIMEOUT_MS ms; " +
+                        "Flyway/compaction busy_timeout $busyTimeoutMs ms)"
+                )
+            }
             return true
         } catch (e: Exception) {
             e.rethrowIfCancellation()
@@ -140,6 +167,79 @@ class DatabaseManager(
     }
 
     private fun buildPool(
+        name: String,
+        url: String,
+        writer: Boolean,
+        maxSize: Int
+    ): HikariDataSource =
+        if (DbDialect.of(url) == DbDialect.POSTGRES) {
+            buildPostgresPool(name, url, maxSize)
+        } else {
+            buildSqlitePool(name, url, writer, maxSize)
+        }
+
+    /**
+     * Forgeyn Postgres persistence lane: HikariCP over pgjdbc with the URL as the single source of
+     * connection truth (host, database, user, password and sslmode all ride the JDBC URL, so no
+     * credential is ever duplicated into a second environment variable).
+     *
+     * The writer keeps `maximumPoolSize = 1` — the one-connection writer discipline the UnitRunner's
+     * in-process mutex already serializes — and readers are plain READ_COMMITTED connections (the
+     * SQLite `PRAGMA query_only` guard has no Postgres equivalent and is unnecessary: the reader
+     * pool never opens write transactions, and Postgres enforces that per statement anyway when a
+     * read-only transaction is requested).
+     */
+    private fun buildPostgresPool(
+        name: String,
+        url: String,
+        maxSize: Int
+    ): HikariDataSource {
+        // An explicit DataSource, never DriverManager: the fat-jar merge deduplicates
+        // META-INF/services/java.sql.Driver (SQLite's and pgjdbc's both claim it), so the
+        // service-loader registration the DriverManager path depends on cannot be relied on.
+        // PGSimpleDataSource parses the URL (including its user/password/sslmode query
+        // parameters) itself; user and password are also set explicitly when present in the
+        // URL, so no implicit URL-property parsing is ever load-bearing.
+        val dataSource =
+            PGSimpleDataSource().also { ds ->
+                ds.setURL(url)
+                pgUserOf(url)?.let { ds.setUser(it) }
+                pgPasswordOf(url)?.let { ds.setPassword(it) }
+            }
+        val hikari =
+            HikariConfig().apply {
+                this.dataSource = dataSource
+                poolName = name
+                maximumPoolSize = maxSize
+                minimumIdle = maxSize
+                connectionTimeout = CHECKOUT_TIMEOUT_MS
+                maxLifetime = 0
+                idleTimeout = 0
+                leakDetectionThreshold = LEAK_DETECTION_MS
+            }
+        return HikariDataSource(hikari)
+    }
+
+    /** The `user` query parameter of a JDBC URL, URL-decoded, or null when absent. */
+    private fun pgUserOf(url: String): String? = pgQueryParam(url, "user")
+
+    /** The `password` query parameter of a JDBC URL, URL-decoded, or null when absent. */
+    private fun pgPasswordOf(url: String): String? = pgQueryParam(url, "password")
+
+    private fun pgQueryParam(url: String,
+        name: String
+    ): String? {
+        val query = url.substringAfter('?', "") ?: return null
+        for (pair in query.split('&')) {
+            val key = pair.substringBefore('=')
+            if (key == name) {
+                return java.net.URLDecoder.decode(pair.substringAfter('=', ""), Charsets.UTF_8)
+            }
+        }
+        return null
+    }
+
+    private fun buildSqlitePool(
         name: String,
         url: String,
         writer: Boolean,
@@ -267,6 +367,10 @@ class DatabaseManager(
      */
     fun runPreUpgradeBackup(): BackupOutcome {
         val url = jdbcUrl ?: return BackupOutcome.SkippedNotFileDb
+        // Forgeyn Postgres persistence lane: the verified file-copy backup is a SQLite concern.
+        // Postgres durability is the server's (Supabase PITR/backups); Flyway's own migration
+        // transactionality guards the schema step.
+        if (DbDialect.of(url) == DbDialect.POSTGRES) return BackupOutcome.SkippedNotFileDb
         if (appConfig.flywayRepair) return BackupOutcome.SkippedSchemaMode
         val mode =
             try {
@@ -358,6 +462,8 @@ class DatabaseManager(
         if (!appConfig.dbCompactOnUpgrade) return
 
         val url = jdbcUrl ?: return
+        // Forgeyn Postgres persistence lane: compaction (VACUUM) is a SQLite-file operation.
+        if (DbDialect.of(url) == DbDialect.POSTGRES) return
         runCatchingNonCancellation {
             StartupCompaction.runOnce(url, appConfig.databaseBusyTimeoutMs)
         }.onSuccess { outcome ->

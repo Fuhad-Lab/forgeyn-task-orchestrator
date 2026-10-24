@@ -10,6 +10,8 @@ import org.jetbrains.exposed.v1.core.LiteralOp
 import org.jetbrains.exposed.v1.core.Op
 import org.jetbrains.exposed.v1.core.QueryBuilder
 import org.jetbrains.exposed.v1.core.Sum
+import org.jetbrains.exposed.v1.core.vendors.PostgreSQLDialect
+import org.jetbrains.exposed.v1.core.vendors.currentDialect
 import org.jetbrains.exposed.v1.core.TextColumnType
 import org.jetbrains.exposed.v1.core.eq
 import org.jetbrains.exposed.v1.core.statements.StatementType
@@ -132,11 +134,11 @@ internal object WorkViewSql {
         when (roots) {
             null -> Unit
             is ResolvedScope.ByRoot -> {
-                parts.add("$alias.root_id IN ($ID_SET_SELECT)")
+                parts.add("$alias.root_id IN (${idSetSelect()})")
                 args.add(idSetArgument(roots.rootIds))
             }
             is ResolvedScope.ByIds -> {
-                parts.add("$alias.id IN ($ID_SET_SELECT)")
+                parts.add("$alias.id IN (${idSetSelect()})")
                 args.add(idSetArgument(roots.ids))
             }
             ResolvedScope.Empty -> throw IllegalArgumentException("an empty scope must be short-circuited before querying")
@@ -189,13 +191,18 @@ internal object WorkViewSql {
      * statement count stays independent of how many ids it batches. Use it inside `IN (...)` and bind
      * [idSetArgument] at its `?`.
      */
-    const val ID_SET_SELECT = "SELECT unhex(value) FROM json_each(?)"
+    fun idSetSelect(): String =
+        if (currentDialect is PostgreSQLDialect) {
+            "SELECT value::uuid FROM json_array_elements_text(?::json)"
+        } else {
+            "SELECT unhex(value) FROM json_each(?)"
+        }
 
-    /** The bound value for [ID_SET_SELECT]: a JSON array of the ids as 32-digit hex strings. */
+    /** The bound value for [idSetSelect]: a JSON array of the ids as 32-digit hex strings. */
     fun idSetArgument(ids: Collection<UUID>): Pair<IColumnType<*>, Any?> =
         TextColumnType() to ids.joinToString(",", "[", "]") { "\"" + it.toString().replace("-", "") + "\"" }
 
-    /** `column IN (<ids>)` for an id set of any size, as one statement with one bound parameter ([ID_SET_SELECT]). */
+    /** `column IN (<ids>)` for an id set of any size, as one statement with one bound parameter ([idSetSelect]). */
     fun inIdSet(
         column: Expression<*>,
         ids: Collection<UUID>,
@@ -203,9 +210,18 @@ internal object WorkViewSql {
         SqlOp {
             val (type, value) = idSetArgument(ids)
             append(column)
-            append(" IN (SELECT unhex(value) FROM json_each(")
-            registerArgument(type, value)
-            append("))")
+            // registerArgument emits the argument's `?` itself, so the select is split around the
+            // registered argument: Postgres binds the JSON-array text then casts it (::json);
+            // SQLite's json_each takes the argument directly.
+            if (currentDialect is PostgreSQLDialect) {
+                append(" IN (SELECT value::uuid FROM json_array_elements_text(")
+                registerArgument(type, value)
+                append("::json))")
+            } else {
+                append(" IN (SELECT unhex(value) FROM json_each(")
+                registerArgument(type, value)
+                append("))")
+            }
         }
 
     /** [role] as stored (lower case). */

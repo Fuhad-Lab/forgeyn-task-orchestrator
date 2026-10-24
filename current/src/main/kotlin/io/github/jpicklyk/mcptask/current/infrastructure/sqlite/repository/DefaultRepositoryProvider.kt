@@ -20,6 +20,7 @@ import io.github.jpicklyk.mcptask.current.application.port.SearchIndex
 import io.github.jpicklyk.mcptask.current.application.port.UsageDailyStore
 import io.github.jpicklyk.mcptask.current.application.port.WorkItemRepository
 import io.github.jpicklyk.mcptask.current.infrastructure.sqlite.DatabaseManager
+import io.github.jpicklyk.mcptask.current.infrastructure.postgres.knowledge.search.PostgresSearchEngine
 import io.github.jpicklyk.mcptask.current.infrastructure.sqlite.knowledge.document.SqliteDocumentStore
 import io.github.jpicklyk.mcptask.current.infrastructure.sqlite.knowledge.document.SqliteLinkStore
 import io.github.jpicklyk.mcptask.current.infrastructure.sqlite.knowledge.search.SqliteSearchEngine
@@ -48,7 +49,15 @@ class DefaultRepositoryProvider(
     private val resourceLeaseRepo by lazy { SQLiteResourceLeaseRepository(databaseManager, clock) }
     private val idempotencyStoreInstance by lazy { SqliteIdempotencyStore(databaseManager) }
     private val eventStoreInstance by lazy { SqliteEventStore(databaseManager) }
-    private val searchEngine by lazy { SqliteSearchEngine(databaseManager) }
+
+    // Forgeyn Postgres persistence lane: the search engine follows the manager's dialect — the
+    // native Postgres engine (tsvector + pg_trgm behind the SearchIndex port) for a
+    // jdbc:postgresql: DATABASE_PATH, the upstream FTS5 engine for SQLite. The application's
+    // SearchService, ranking and fusion are shared by both untouched.
+    private val searchEngine by lazy {
+        if (databaseManager.isPostgres) PostgresSearchEngine(databaseManager)
+        else SqliteSearchEngine(databaseManager)
+    }
     private val callLogStoreInstance by lazy { SqliteCallLogStore(databaseManager) }
     private val runStoreInstance by lazy { SqliteRunStore(databaseManager) }
     private val runSeatStoreInstance by lazy { SqliteRunSeatStore(databaseManager, clock) }

@@ -213,8 +213,12 @@ class SqliteEventStore(
         if (batch <= 0) return 0
         return databaseManager.writeTx("EventStore.prune") {
             val guarded = type == DomainEvent.CLAIM_EXPIRED
+            // Forgeyn Postgres persistence lane: INDEXED BY is SQLite's query-plan hint and is a
+            // syntax error on Postgres, where the planner chooses its own index for the same
+            // predicate (idx_events_type_occurred exists identically in the Postgres baseline).
+            val indexHint = if (databaseManager.isPostgres) "" else "INDEXED BY idx_events_type_occurred "
             val sql =
-                "SELECT seq FROM events INDEXED BY idx_events_type_occurred " +
+                "SELECT seq FROM events $indexHint" +
                     "WHERE type = ? AND occurred_at < ? AND seq < ?" +
                     (if (guarded) LATEST_PER_ENTITY_GUARD else "") +
                     " ORDER BY occurred_at LIMIT ?"

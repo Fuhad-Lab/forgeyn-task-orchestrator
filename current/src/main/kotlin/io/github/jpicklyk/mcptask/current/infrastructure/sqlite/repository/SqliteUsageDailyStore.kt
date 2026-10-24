@@ -51,8 +51,12 @@ class SqliteUsageDailyStore(
             val text = TextColumnType()
             val from = "$day 00:00:00.000"
             val to = "${day.plusDays(1)} 00:00:00.000"
+            // Forgeyn Postgres persistence lane: SQLite's COALESCE(root_id, x'') folds a NULL root
+            // into the 16 zero bytes (the nil UUID); Postgres spells the same sentinel natively.
+            val foldSql =
+                if (databaseManager.isPostgres) FOLD_SQL.replace("COALESCE(root_id, x'')", "COALESCE(root_id, '00000000-0000-0000-0000-000000000000'::uuid)") else FOLD_SQL
             exec(
-                FOLD_SQL,
+                foldSql,
                 args = listOf<Pair<IColumnType<*>, Any?>>(text to day.toString(), text to from, text to to)
             )
             exec(

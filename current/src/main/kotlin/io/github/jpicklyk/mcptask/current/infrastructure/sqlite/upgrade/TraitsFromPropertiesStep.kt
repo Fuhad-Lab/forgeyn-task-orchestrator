@@ -44,7 +44,7 @@ class TraitsFromPropertiesStep : DataStep {
     }
 
     private class Migration(
-        val rowId: Long,
+        val rowId: Any,
         val names: List<String>,
         val remaining: String?,
         val item: String
@@ -52,9 +52,14 @@ class TraitsFromPropertiesStep : DataStep {
 
     override suspend fun run(scope: WriteScope): Int {
         val tx = TransactionManager.current()
+        // Forgeyn Postgres persistence lane: the backfill fragments are dialect-aware (BackfillSql).
+        val pg = BackfillSql.postgres()
+        val itemKey = BackfillSql.uuidKey("item_id", pg)
+        val itemKey2 = BackfillSql.uuidKey("id", pg)
+        val rowCol = BackfillSql.rowColumn(pg)
 
         val existing = HashMap<String, Existing>()
-        tx.exec("SELECT lower(hex(item_id)) AS item, position, name FROM item_traits") { rs ->
+        tx.exec("SELECT $itemKey AS item, position, name FROM item_traits") { rs ->
             while (rs.next()) {
                 val e = existing.getOrPut(rs.getString("item")) { Existing() }
                 e.names += rs.getString("name")
@@ -65,7 +70,7 @@ class TraitsFromPropertiesStep : DataStep {
         val migrations = mutableListOf<Migration>()
         val unmigratable = mutableListOf<String>()
         tx.exec(
-            "SELECT rowid AS rid, lower(hex(id)) AS item, properties FROM work_items " +
+            "SELECT $rowCol AS rid, $itemKey2 AS item, properties FROM work_items " +
                 "WHERE properties IS NOT NULL AND trim(properties) <> ''"
         ) { rs ->
             while (rs.next()) {
@@ -73,12 +78,17 @@ class TraitsFromPropertiesStep : DataStep {
                 when (val outcome = parse(rs.getString("properties"))) {
                     Outcome.Untouched -> Unit
                     Outcome.Unmigratable -> unmigratable += item
-                    is Outcome.Migrate -> migrations += Migration(rs.getLong("rid"), outcome.names, outcome.remaining, item)
+                    is Outcome.Migrate -> {
+                        @Suppress("UNCHECKED_CAST")
+                        val rid: Any = if (pg) rs.getObject("rid")!! else rs.getLong("rid")
+                        migrations += Migration(rid, outcome.names, outcome.remaining, item)
+                    }
                 }
             }
         }
 
-        val rowType = LongColumnType()
+        val rowType: org.jetbrains.exposed.v1.core.ColumnType<*> =
+            if (pg) org.jetbrains.exposed.v1.core.java.UUIDColumnType() else LongColumnType()
         val textType = TextColumnType()
         val intType = IntegerColumnType()
         for (m in migrations) {
@@ -86,12 +96,15 @@ class TraitsFromPropertiesStep : DataStep {
             for (traitName in m.names) {
                 if (!e.names.add(traitName)) continue
                 tx.exec(
-                    "INSERT INTO item_traits (item_id, position, name) SELECT id, ?, ? FROM work_items WHERE rowid = ?",
+                    "INSERT INTO item_traits (item_id, position, name) SELECT id, ?, ? FROM work_items WHERE $rowCol = ?",
                     args = listOf(intType to e.nextPosition, textType to traitName, rowType to m.rowId)
                 )
                 e.nextPosition++
             }
-            tx.exec("UPDATE work_items SET properties = ? WHERE rowid = ?", args = listOf(textType to m.remaining, rowType to m.rowId))
+            tx.exec(
+                "UPDATE work_items SET properties = ? WHERE $rowCol = ?",
+                args = listOf(textType to m.remaining, rowType to m.rowId)
+            )
         }
 
         if (unmigratable.isNotEmpty()) {

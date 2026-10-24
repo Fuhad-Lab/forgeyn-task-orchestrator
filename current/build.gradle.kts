@@ -1,4 +1,5 @@
 import java.util.Properties
+import java.util.zip.ZipFile
 
 plugins {
     alias(libs.plugins.kotlin.jvm)
@@ -65,6 +66,8 @@ dependencies {
 
     // Database
     implementation(libs.sqlite)
+    // Forgeyn Postgres persistence lane: the Supabase Postgres adapter (jdbc:postgresql: DATABASE_PATH)
+    implementation(libs.postgresql)
     implementation(libs.exposed.core)
     implementation(libs.exposed.dao)
     implementation(libs.exposed.jdbc)
@@ -73,6 +76,8 @@ dependencies {
 
     // Flyway migration
     implementation(libs.flyway.core)
+    // Forgeyn Postgres persistence lane: Flyway's modular Postgres support (required since Flyway 10)
+    implementation(libs.flyway.database.postgresql)
 
     // Logging
     implementation(libs.slf4j)
@@ -279,6 +284,50 @@ tasks.named<org.jetbrains.kotlin.gradle.tasks.KotlinCompile>("compileTestKotlin"
     }
 }
 
+// Forgeyn Postgres persistence lane: merges every META-INF/services/* file of the runtime
+// classpath into one directory (unique lines, order of first appearance) that the fat jar then
+// includes. The upstream jar task's DuplicatesStrategy.EXCLUDE silently kept only the FIRST
+// dependency's service file per name — which dropped pgjdbc's java.sql.Driver registration ("No
+// suitable driver") and Flyway's plugin registrations (ResourceTypeProvider gone => every
+// migration filename "unrecognised"). Service-loader files are additive by specification, so
+// merging is the correct semantics for a fat jar.
+val mergedServicesDir = layout.buildDirectory.dir("merged-services")
+
+val mergeServiceFiles =
+    tasks.register("mergeServiceFiles") {
+        outputs.dir(mergedServicesDir)
+        doLast {
+            val outDir = mergedServicesDir.get().asFile
+            outDir.deleteRecursively()
+            val jars =
+                configurations.runtimeClasspath
+                    .get()
+                    .filter { it.isFile && it.name.endsWith(".jar") }
+            val merged = mutableMapOf<String, LinkedHashSet<String>>()
+            jars.forEach { jarFile ->
+                ZipFile(jarFile).use { zip ->
+                    zip.entries().asSequence()
+                        .filter { !it.isDirectory && it.name.startsWith("META-INF/services/") }
+                        .forEach { entry ->
+                            val lines =
+                                zip.getInputStream(entry).bufferedReader().readText()
+                                    .lines()
+                                    .map { it.trim() }
+                                    .filter { it.isNotEmpty() && !it.startsWith("#") }
+                            merged.getOrPut(entry.name) { LinkedHashSet() }.addAll(lines)
+                        }
+                }
+            }
+            merged.forEach { (name, lines) ->
+                val target = outDir.resolve(name)
+                target.parentFile.mkdirs()
+                target.writeText(lines.joinToString("\n") + "\n")
+            }
+            val jarCount = jars.count()
+            logger.lifecycle("Merged {} service file(s) from {} jar(s)", merged.size, jarCount)
+        }
+    }
+
 tasks.jar {
     manifest {
         attributes["Main-Class"] = "io.github.jpicklyk.mcptask.current.CurrentMainKt"
@@ -288,12 +337,18 @@ tasks.jar {
     from(sourceSets.main.get().output)
 
     dependsOn(configurations.runtimeClasspath)
+    dependsOn(mergeServiceFiles)
     from({
         configurations.runtimeClasspath
             .get()
             .filter { it.name.endsWith("jar") }
             .map { zipTree(it) }
-    })
+    }) {
+        // The dependency trees' service files are replaced by the merged set below; scoping the
+        // exclude to THIS source keeps the merged directory's own META-INF/services entries.
+        exclude("META-INF/services/**")
+    }
+    from(mergedServicesDir)
 
     exclude("META-INF/*.SF", "META-INF/*.DSA", "META-INF/*.RSA")
     archiveBaseName.set("mcp-task-orchestrator-current")

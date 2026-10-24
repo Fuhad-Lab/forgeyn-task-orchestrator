@@ -38,11 +38,16 @@ class TypeBackfillStep(
     override suspend fun run(scope: WriteScope): Int {
         val global = globalLayer()
         val tx = TransactionManager.current()
+        // Forgeyn Postgres persistence lane: the backfill fragments are dialect-aware (BackfillSql).
+        val pg = BackfillSql.postgres()
+        val rootKey = BackfillSql.uuidKey("h.root_id", pg)
+        val rootKey2 = BackfillSql.uuidKey("root_id", pg)
+        val rowCol = BackfillSql.rowColumn(pg)
 
         val perRoot = mutableMapOf<String, LegacyTypeInference.Layer>()
         // Each root's head version (a reset head means the root has no per-root config, so no layer).
         tx.exec(
-            "SELECT lower(hex(h.root_id)) AS root, v.yaml AS config_yaml FROM config_heads h " +
+            "SELECT $rootKey AS root, v.yaml AS config_yaml FROM config_heads h " +
                 "JOIN config_versions v ON v.id = h.version_id WHERE h.scope = 'root' AND v.source <> 'reset'"
         ) { rs ->
             while (rs.next()) {
@@ -52,12 +57,12 @@ class TypeBackfillStep(
         }
 
         class Untyped(
-            val rowId: Long,
+            val rowId: Any,
             val inferred: String
         )
         val untyped = mutableListOf<Untyped>()
         tx.exec(
-            "SELECT rowid AS rid, lower(hex(root_id)) AS root, tags FROM work_items WHERE type IS NULL OR trim(type) = ''"
+            "SELECT $rowCol AS rid, $rootKey2 AS root, tags FROM work_items WHERE type IS NULL OR trim(type) = ''"
         ) { rs ->
             while (rs.next()) {
                 val root = rs.getString("root")
@@ -67,14 +72,20 @@ class TypeBackfillStep(
                         root?.let { perRoot[it] },
                         global
                     )
-                untyped += Untyped(rs.getLong("rid"), inferred)
+                @Suppress("UNCHECKED_CAST")
+                val rid: Any = if (pg) rs.getObject("rid")!! else rs.getLong("rid")
+                untyped += Untyped(rid, inferred)
             }
         }
 
         val textType = VarCharColumnType(255)
-        val rowType = LongColumnType()
+        val rowType: org.jetbrains.exposed.v1.core.ColumnType<*> =
+            if (pg) org.jetbrains.exposed.v1.core.java.UUIDColumnType() else LongColumnType()
         for (row in untyped) {
-            tx.exec("UPDATE work_items SET type = ? WHERE rowid = ?", args = listOf(textType to row.inferred, rowType to row.rowId))
+            tx.exec(
+                "UPDATE work_items SET type = ? WHERE $rowCol = ?",
+                args = listOf(textType to row.inferred, rowType to row.rowId)
+            )
         }
         logger.info(
             "type-backfill: typed {} item(s) ({} untyped)",
