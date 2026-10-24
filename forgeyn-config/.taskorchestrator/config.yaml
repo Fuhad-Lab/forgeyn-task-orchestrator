@@ -1,0 +1,38 @@
+# Forgeyn Task Orchestrator — the server workflow configuration.
+#
+# The Forgeyn lifecycle maps onto the orchestrator's roles:
+#   Planning    -> the queue-phase `requirements` note gate (an item cannot start without it)
+#   Queued      -> role `queue` with persisted dependencies
+#   Implementation -> role `work` gated on dependencies + queue notes
+#   Review & verification -> role `review` gated on the `verification` note
+#   Completed   -> role `terminal`, reachable only through the server-enforced gates
+#   Blocked     -> role `blocked` with previousRole preserved (resume returns to it)
+#
+# Two item types keep small requests lightweight (THE LIGHTWEIGHT PATH LAW): a complex request
+# plans as `forgeyn-feature` (full gates incl. verification), a small straightforward request as
+# `forgeyn-simple` (no review phase — work -> terminal directly once implementation notes exist).
+work_item_schemas:
+  forgeyn-feature:
+    notes:
+      - key: requirements
+        role: queue
+        required: true
+        description: "Objective, acceptance criteria and test strategy before work starts"
+        guidance: "Cover: the user's objective in one line, measurable acceptance criteria, the files or areas in scope, and how completion will be verified."
+      - key: implementation-notes
+        role: work
+        required: true
+        description: "What was built and why"
+        guidance: "Record what was actually implemented, key decisions and their reasons, and anything the next session must know."
+      - key: verification
+        role: review
+        required: true
+        description: "Verification evidence before completion"
+        guidance: "Record the checks that were actually run and their real results: commands, outputs, test names, evidence links. Never infer success."
+  forgeyn-simple:
+    notes:
+      - key: implementation-notes
+        role: work
+        required: true
+        description: "What was done"
+        guidance: "One short paragraph: what changed and why that satisfies the request."

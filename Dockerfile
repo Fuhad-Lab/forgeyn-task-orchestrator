@@ -86,4 +86,9 @@ CMD ["java", "-Dfile.encoding=UTF-8", "-Djava.awt.headless=true", "-Duser.timezo
 # --- runtime-current target (4.0 Current - active) ---
 FROM runtime-base AS runtime-current
 COPY --from=builder --chown=appuser:appgroup /app/current/build/libs/mcp-task-orchestrator-current-*.jar /app/orchestrator.jar
+# Forgeyn: the server workflow configuration (work_item_schemas — the Forgeyn lifecycle gates),
+# baked in and imported at boot by the server-config-import step. Per-root overrides can still be
+# pushed through the config tool; this file is the server-level baseline.
+COPY --chown=appuser:appgroup forgeyn-config /app/forgeyn-config
+ENV AGENT_CONFIG_DIR=/app/forgeyn-config
 ENV DATABASE_PATH=data/current-tasks.db
