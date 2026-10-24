@@ -1,0 +1,31 @@
+# ============================================================
+# Forgeyn prebuilt runtime — the Render companion deployment image.
+#
+# The jar is built and committed by the maintainer (./gradlew :current:jar -x test) — see
+# Dockerfile for the full from-source multi-stage build. This variant exists because Render's
+# builder cannot reliably run the Gradle toolchain (distribution downloads fail there); it also
+# makes deploys fast (~1 min) and byte-pinned to the committed jar.
+# ============================================================
+FROM eclipse-temurin:21-jre
+
+WORKDIR /app
+
+# The Forgeyn server workflow configuration (work_item_schemas — the lifecycle gates), imported
+# at boot by the server-config-import step.
+COPY forgeyn-config /app/forgeyn-config
+
+# The fat jar (service-loader files merged — see current/build.gradle.kts mergeServiceFiles).
+COPY mcp-task-orchestrator-current.jar /app/orchestrator.jar
+
+ENV AGENT_CONFIG_DIR=/app/forgeyn-config
+ENV MCP_TRANSPORT=http
+ENV LOG_LEVEL=INFO
+ENV MCP_HTTP_HOST=0.0.0.0
+ENV MCP_HTTP_PORT=3001
+ENV DATABASE_PATH=data/current-tasks.db
+ENV READINESS_FILE=/tmp/mcp-task-orchestrator.ready
+EXPOSE 3001
+
+# Java 21 needs no native-access flag (that was Java 25 + SQLite); pin UTC for the canonical
+# timestamp comparisons, exactly like the upstream image.
+CMD ["java", "-Xmx384m", "-Dfile.encoding=UTF-8", "-Djava.awt.headless=true", "-Duser.timezone=UTC", "-jar", "orchestrator.jar"]
