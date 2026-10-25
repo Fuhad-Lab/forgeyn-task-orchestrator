@@ -48,5 +48,7 @@ EXPOSE 10000
 # below (SerialGC, capped metaspace/code-cache, small initial heap) keeps total JVM RSS ≈ 170MB
 # (measured) with ample headroom for the Supabase pool connections.
 #
-# The proxy starts in the background; exec java as PID 1 so a JVM death restarts the container.
-CMD ["sh", "-c", "bun /app/port-proxy.ts & exec java -Xms32m -Xmx256m -XX:MaxMetaspaceSize=128m -XX:ReservedCodeCacheSize=48m -XX:+UseSerialGC -XX:+PerfDisableSharedMem -XX:TieredStopAtLevel=1 -Djava.net.preferIPv4Stack=true -Dfile.encoding=UTF-8 -Djava.awt.headless=true -Duser.timezone=UTC -jar orchestrator.jar"]
+# The JVM boots in the background with its output captured to /app/jvm.log (the proxy's
+# visibility beacon tails it); the proxy binds the public port instantly. `wait -n` makes the
+# container exit when EITHER process dies — Render then restarts it (self-healing).
+CMD ["sh", "-c", "java -Xms32m -Xmx256m -XX:MaxMetaspaceSize=128m -XX:ReservedCodeCacheSize=48m -XX:+UseSerialGC -XX:+PerfDisableSharedMem -XX:TieredStopAtLevel=1 -Djava.net.preferIPv4Stack=true -Dfile.encoding=UTF-8 -Djava.awt.headless=true -Duser.timezone=UTC -jar orchestrator.jar > /app/jvm.log 2>&1 & bun /app/port-proxy.ts & wait -n; exit 1"]

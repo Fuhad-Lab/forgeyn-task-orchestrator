@@ -76,3 +76,48 @@ Bun.serve({
 });
 
 console.log(`[port-proxy] listening on :${PORT} -> ${UPSTREAM} (allowed hosts: ${ALLOWED_HOSTS.join(",") || "any"})`);
+
+// ── THE RENDER VISIBILITY BEACON ─────────────────────────────────────────────
+// Failed Render deploys leave no readable logs, so the proxy reports its own state
+// and the JVM's log tail to a Supabase diagnostics table every 15s (opt-in via env).
+const BEACON_URL = process.env.DIAG_REST_URL || "";
+const BEACON_KEY = process.env.DIAG_REST_KEY || "";
+const SERVICE_TAG = process.env.DIAG_SERVICE_TAG || "forgeyn-task-orchestrator";
+const JVM_LOG = process.env.DIAG_JVM_LOG || "/app/jvm.log";
+
+if (BEACON_URL && BEACON_KEY) {
+  const readFile = async (p: string, max: number): Promise<string> => {
+    try {
+      const f = Bun.file(p);
+      const size = f.size ?? 0;
+      if (size > max) return await f.slice(size - max).text();
+      return await f.text();
+    } catch {
+      return "<unreadable>";
+    }
+  };
+  const beacon = async () => {
+    let upstream: string;
+    try {
+      const r = await fetch(`${UPSTREAM}/api/v1/health`, { signal: AbortSignal.timeout(3000) });
+      upstream = `health:${r.status}`;
+    } catch (e) {
+      upstream = `unreachable:${String(e).slice(0, 120)}`;
+    }
+    try {
+      await fetch(BEACON_URL, {
+        method: "POST",
+        headers: { "content-type": "application/json", apikey: BEACON_KEY, authorization: `Bearer ${BEACON_KEY}` },
+        body: JSON.stringify({
+          service: SERVICE_TAG,
+          note: `pid=${process.pid} port=${PORT} upstream=${upstream} ts=${new Date().toISOString()}`,
+          jvm_log_tail: (await readFile(JVM_LOG, 6000)).slice(-6000),
+        }),
+      });
+    } catch {
+      /* the beacon must never break the proxy */
+    }
+  };
+  void beacon();
+  setInterval(beacon, 15_000);
+}
