@@ -49,6 +49,7 @@ EXPOSE 10000
 # (measured) with ample headroom for the Supabase pool connections.
 #
 # The JVM boots in the background with its output captured to /app/jvm.log (the proxy's
-# visibility beacon tails it); the proxy binds the public port instantly. `wait -n` makes the
-# container exit when EITHER process dies — Render then restarts it (self-healing).
-CMD ["sh", "-c", "java -Xms32m -Xmx256m -XX:MaxMetaspaceSize=128m -XX:ReservedCodeCacheSize=48m -XX:+UseSerialGC -XX:+PerfDisableSharedMem -XX:TieredStopAtLevel=1 -Djava.net.preferIPv4Stack=true -Dfile.encoding=UTF-8 -Djava.awt.headless=true -Duser.timezone=UTC -jar orchestrator.jar > /app/jvm.log 2>&1 & bun /app/port-proxy.ts & wait -n; exit 1"]
+# visibility beacon tails it); the proxy binds the public port instantly. The supervisor loop
+# (dash-compatible — Ubuntu's /bin/sh has no `wait -n`, which killed the container at launch)
+# exits when EITHER process dies — Render then restarts the container (self-healing).
+CMD ["sh", "-c", "java -Xms32m -Xmx256m -XX:MaxMetaspaceSize=128m -XX:ReservedCodeCacheSize=48m -XX:+UseSerialGC -XX:+PerfDisableSharedMem -XX:TieredStopAtLevel=1 -Djava.net.preferIPv4Stack=true -Dfile.encoding=UTF-8 -Djava.awt.headless=true -Duser.timezone=UTC -jar orchestrator.jar > /app/jvm.log 2>&1 & JP=$!; bun /app/port-proxy.ts & BP=$!; while :; do sleep 5; if ! kill -0 $JP 2>/dev/null; then echo JVM_DIED >> /app/jvm.log; exit 1; fi; if ! kill -0 $BP 2>/dev/null; then echo PROXY_DIED >> /app/jvm.log; exit 1; fi; done"]
