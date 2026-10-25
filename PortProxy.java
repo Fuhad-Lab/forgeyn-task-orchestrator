@@ -160,7 +160,7 @@ public final class PortProxy {
     private static String tailLog() {
         try {
             byte[] all = Files.readAllBytes(JVM_LOG);
-            int from = Math.max(0, all.length - 6000);
+            int from = Math.max(0, all.length - 20000);
             return new String(all, from, all.length - from, StandardCharsets.UTF_8);
         } catch (Exception e) {
             return "<unreadable:" + e + ">";
