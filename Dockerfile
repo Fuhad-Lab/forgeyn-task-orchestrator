@@ -1,5 +1,6 @@
-FROM oven/bun:1
-RUN apt-get update && apt-get install -y --no-install-recommends postgresql-client && rm -rf /var/lib/apt/lists/*
-COPY diag.js /app/diag.js
+FROM eclipse-temurin:21-jre
+WORKDIR /app
+COPY test-classes/PgTest.class /app/PgTest.class
+COPY mcp-task-orchestrator-current.jar /app/orchestrator.jar
 EXPOSE 10000
-CMD ["bun", "/app/diag.js"]
+CMD ["java", "-Djava.security.egd=file:/dev/./urandom", "-cp", "/app:/app/orchestrator.jar", "PgTest"]
