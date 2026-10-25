@@ -28,4 +28,10 @@ EXPOSE 3001
 
 # Java 21 needs no native-access flag (that was Java 25 + SQLite); pin UTC for the canonical
 # timestamp comparisons, exactly like the upstream image.
-CMD ["java", "-Xmx384m", "-Dfile.encoding=UTF-8", "-Djava.awt.headless=true", "-Duser.timezone=UTC", "-jar", "orchestrator.jar"]
+#
+# THE 512MB LAW (2026-10-25, the three update_failed deploys at ~34s runtime): Render free tier
+# gives the container 512MB total. The previous -Xmx384m + default metaspace/code-cache/GC threads
+# pushed RSS past the limit and the OOM killer ended the boot mid-Flyway (deterministic ~34s).
+# The lean set below (SerialGC, capped metaspace/code-cache, small initial heap) keeps total JVM
+# RSS ≈ 350-400MB with headroom for the 5 Supabase pool connections.
+CMD ["java", "-Xms32m", "-Xmx256m", "-XX:MaxMetaspaceSize=128m", "-XX:ReservedCodeCacheSize=48m", "-XX:+UseSerialGC", "-XX:+PerfDisableSharedMem", "-Dfile.encoding=UTF-8", "-Djava.awt.headless=true", "-Duser.timezone=UTC", "-jar", "orchestrator.jar"]
