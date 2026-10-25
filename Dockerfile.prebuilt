@@ -5,8 +5,19 @@
 # Dockerfile for the full from-source multi-stage build. This variant exists because Render's
 # builder cannot reliably run the Gradle toolchain (distribution downloads fail there); it also
 # makes deploys fast (~1 min) and byte-pinned to the committed jar.
+#
+# THE SLOW-JVM PORT-BIND LAW (2026-10-25): Render's free tier (0.1 CPU) cannot boot the
+# Kotlin/Ktor/Exposed/Flyway JVM inside Render's port-bind startup window, so every deploy was
+# marked update_failed ~40s in — before the JVM ever listened (proven by the forgeyn-net-diag
+# probe service: the pooler IS reachable, a Bun server binds and goes live in ~40s). The fix:
+# a Bun port-proxy binds the public port the moment the container starts and forwards to the
+# JVM on its loopback port, answering honest 503s until the JVM is up. The JVM binds
+# 127.0.0.1:${MCP_HTTP_PORT} (default 3001); the proxy owns the public port.
 # ============================================================
 FROM eclipse-temurin:21-jre
+
+# Bun's static binary — the port proxy and its instant bind.
+COPY --from=oven/bun:1 /usr/local/bin/bun /usr/local/bin/bun
 
 WORKDIR /app
 
@@ -17,11 +28,15 @@ COPY forgeyn-config /app/forgeyn-config
 # The fat jar (service-loader files merged — see current/build.gradle.kts mergeServiceFiles).
 COPY mcp-task-orchestrator-current.jar /app/orchestrator.jar
 
+# The instant-bind port proxy (public port -> JVM loopback port).
+COPY port-proxy.ts /app/port-proxy.ts
+
 ENV AGENT_CONFIG_DIR=/app/forgeyn-config
 ENV MCP_TRANSPORT=http
 ENV LOG_LEVEL=INFO
-ENV MCP_HTTP_HOST=0.0.0.0
-ENV MCP_HTTP_PORT=10000
+ENV MCP_HTTP_HOST=127.0.0.1
+ENV MCP_HTTP_PORT=3001
+ENV PORT_PROXY_PORT=10000
 ENV DATABASE_PATH=data/current-tasks.db
 ENV READINESS_FILE=/tmp/mcp-task-orchestrator.ready
 EXPOSE 10000
@@ -29,9 +44,9 @@ EXPOSE 10000
 # Java 21 needs no native-access flag (that was Java 25 + SQLite); pin UTC for the canonical
 # timestamp comparisons, exactly like the upstream image.
 #
-# THE 512MB LAW (2026-10-25, the three update_failed deploys at ~34s runtime): Render free tier
-# gives the container 512MB total. The previous -Xmx384m + default metaspace/code-cache/GC threads
-# pushed RSS past the limit and the OOM killer ended the boot mid-Flyway (deterministic ~34s).
-# The lean set below (SerialGC, capped metaspace/code-cache, small initial heap) keeps total JVM
-# RSS ≈ 350-400MB with headroom for the 5 Supabase pool connections.
-CMD ["java", "-Xms32m", "-Xmx256m", "-XX:MaxMetaspaceSize=128m", "-XX:ReservedCodeCacheSize=48m", "-XX:+UseSerialGC", "-XX:+PerfDisableSharedMem", "-XX:TieredStopAtLevel=1", "-Djava.net.preferIPv4Stack=true", "-Dfile.encoding=UTF-8", "-Djava.awt.headless=true", "-Duser.timezone=UTC", "-jar", "orchestrator.jar"]
+# THE 512MB LAW (2026-10-25): Render free tier gives the container 512MB total. The lean set
+# below (SerialGC, capped metaspace/code-cache, small initial heap) keeps total JVM RSS ≈ 170MB
+# (measured) with ample headroom for the Supabase pool connections.
+#
+# The proxy starts in the background; exec java as PID 1 so a JVM death restarts the container.
+CMD ["sh", "-c", "bun /app/port-proxy.ts & exec java -Xms32m -Xmx256m -XX:MaxMetaspaceSize=128m -XX:ReservedCodeCacheSize=48m -XX:+UseSerialGC -XX:+PerfDisableSharedMem -XX:TieredStopAtLevel=1 -Djava.net.preferIPv4Stack=true -Dfile.encoding=UTF-8 -Djava.awt.headless=true -Duser.timezone=UTC -jar orchestrator.jar"]
