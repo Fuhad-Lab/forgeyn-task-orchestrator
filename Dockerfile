@@ -1,94 +1,59 @@
 # ============================================================
-# Multi-stage build for MCP Task Orchestrator
+# Forgeyn prebuilt runtime — the Render companion deployment image.
+#
+# The jar is built and committed by the maintainer (./gradlew :current:jar -x test) — see
+# Dockerfile for the full from-source multi-stage build. This variant exists because Render's
+# builder cannot reliably run the Gradle toolchain (distribution downloads fail there); it also
+# makes deploys fast (~1 min) and byte-pinned to the committed jar.
+#
+# THE SLOW-JVM PORT-BIND LAW (2026-10-25): Render's free tier (0.1 CPU) cannot boot the
+# Kotlin/Ktor/Exposed/Flyway orchestrator JVM inside Render's port-bind startup window, so
+# every deploy was marked update_failed ~40s in — before the JVM ever listened (proven by the
+# forgeyn-net-diag probe service: the Supabase pooler IS reachable from Render; a fresh service
+# binds and goes live in ~40s). THE FIX: a tiny pure-Java port proxy (PortProxy.java, compiled
+# in the build stage — no cross-runtime dependency: a bun binary copied from another image
+# failed to run on this base) binds the public port within ~1s of container start, forwards
+# everything to the orchestrator on its loopback port, answers honest 503s until the
+# orchestrator is up, and restores the public Host allowlist the orchestrator can no longer see.
+#
+# The proxy also runs THE RENDER VISIBILITY BEACON: failed deploys leave no readable logs, so
+# it reports its state + the orchestrator's jvm.log tail to the forgeyn_deploy_beacon Supabase
+# table every 15s (opt-in via DIAG_REST_URL / DIAG_REST_KEY env).
 # ============================================================
+FROM eclipse-temurin:21 AS build
+WORKDIR /build
+COPY PortProxy.java .
+RUN javac -d /build/classes PortProxy.java
 
-# --- Builder stage ---
-FROM eclipse-temurin:21-jdk AS builder
-
+FROM eclipse-temurin:21-jre
 WORKDIR /app
 
-# Gradle wrapper and build configuration (cached aggressively)
-COPY gradlew gradlew.bat ./
-COPY gradle gradle
-COPY build.gradle.kts settings.gradle.kts gradle.properties ./
-COPY version.properties ./
-COPY current/build.gradle.kts current/
-RUN sed -i 's/\r$//' gradlew && chmod +x gradlew
+# The Forgeyn server workflow configuration (work_item_schemas — the lifecycle gates), imported
+# at boot by the server-config-import step.
+COPY forgeyn-config /app/forgeyn-config
 
-# Download dependencies (cached until build files change)
-RUN ./gradlew dependencies --no-daemon
+# The fat jar (service-loader files merged — see current/build.gradle.kts mergeServiceFiles).
+COPY mcp-task-orchestrator-current.jar /app/orchestrator.jar
 
-# Source code (changes frequently, placed last for cache)
-COPY current/src current/src
+# The instant-bind pure-Java port proxy (public port -> orchestrator loopback port).
+COPY --from=build /build/classes /app/proxy-classes
 
-RUN ./gradlew :current:jar --no-daemon -x test
-
-# --- Runtime base stage (shared configuration for all runtime targets) ---
-FROM amazoncorretto:25-al2023-headless AS runtime-base
-
-# Bases: the builder stage is eclipse-temurin:21-jdk; the runtime is Amazon Corretto 25 on AL2023 (headless),
-# which addresses high severity CVEs seen in earlier Temurin runtime images.
-# Using headless variant (runtime-only, no GUI libraries) for optimal production container size
-
-LABEL org.opencontainers.image.title="MCP Task Orchestrator" \
-      org.opencontainers.image.description="Kotlin MCP server for hierarchical task management with AI assistants" \
-      org.opencontainers.image.url="https://github.com/jpicklyk/task-orchestrator" \
-      org.opencontainers.image.source="https://github.com/jpicklyk/task-orchestrator" \
-      org.opencontainers.image.vendor="jpicklyk" \
-      org.opencontainers.image.licenses="MIT" \
-      io.modelcontextprotocol.server.name="io.github.jpicklyk/task-orchestrator"
-
-WORKDIR /app
-
-# Create non-root user and required directories
-# shadow-utils provides groupadd/useradd on AL2023 minimal images
-RUN dnf install -y shadow-utils \
-    && dnf clean all \
-    && groupadd -r -g 1001 appgroup \
-    && useradd -r -u 1001 -g appgroup -d /app -s /sbin/nologin appuser \
-    && mkdir -p /app/data \
-    && chown -R appuser:appgroup /app
-
-# Volume for SQLite database persistence
-VOLUME /app/data
-
-# Environment variables (only those consumed by the application)
-ENV MCP_TRANSPORT=stdio
-ENV LOG_LEVEL=INFO
-ENV AGENT_CONFIG_DIR=/project
-ENV MCP_HTTP_HOST=0.0.0.0
-ENV MCP_HTTP_PORT=3001
-ENV READINESS_FILE=/tmp/mcp-task-orchestrator.ready
-EXPOSE 3001
-
-# Switch to non-root user
-USER appuser
-
-# Signal Docker to send SIGTERM for graceful shutdown
-STOPSIGNAL SIGTERM
-
-# Health check: the readiness marker at $READINESS_FILE is written only after the server has
-# actually started serving (stdio session created / HTTP listener started) and removed on every
-# shutdown path, so "file present" == "actually serving" for either transport. A marker file is
-# used instead of an HTTP probe because this runtime image has no curl/wget, and /api/v1/health
-# only exists under MCP_TRANSPORT=http with API_ENABLED=true (default transport is stdio).
-HEALTHCHECK --interval=30s --timeout=3s --start-period=20s --retries=3 \
-    CMD sh -c 'test -f "$READINESS_FILE"'
-
-# Run the MCP server
-# --enable-native-access=ALL-UNNAMED: Required for SQLite JDBC native library loading in Java 25+
-# -Duser.timezone=UTC: pins the JVM default timezone so claim TTL/expiry comparisons (Exposed
-#   `timestamp` columns vs SQLite datetime('now')) are computed against the same clock regardless of
-#   host/container timezone config. Non-Docker launches (`java -jar`) get the same guarantee via
-#   JvmTimezone.enforceUtc() in CurrentMain, which overrides a non-UTC default with a WARN.
-CMD ["java", "-Dfile.encoding=UTF-8", "-Djava.awt.headless=true", "-Duser.timezone=UTC", "--enable-native-access=ALL-UNNAMED", "-jar", "orchestrator.jar"]
-
-# --- runtime-current target (4.0 Current - active) ---
-FROM runtime-base AS runtime-current
-COPY --from=builder --chown=appuser:appgroup /app/current/build/libs/mcp-task-orchestrator-current-*.jar /app/orchestrator.jar
-# Forgeyn: the server workflow configuration (work_item_schemas — the Forgeyn lifecycle gates),
-# baked in and imported at boot by the server-config-import step. Per-root overrides can still be
-# pushed through the config tool; this file is the server-level baseline.
-COPY --chown=appuser:appgroup forgeyn-config /app/forgeyn-config
 ENV AGENT_CONFIG_DIR=/app/forgeyn-config
+ENV MCP_TRANSPORT=http
+ENV LOG_LEVEL=INFO
+ENV MCP_HTTP_HOST=127.0.0.1
+ENV MCP_HTTP_PORT=3001
+ENV PROXY_PORT=10000
 ENV DATABASE_PATH=data/current-tasks.db
+ENV READINESS_FILE=/tmp/mcp-task-orchestrator.ready
+EXPOSE 10000
+
+# THE 512MB LAW: Render free tier gives the container 512MB total. Both JVMs run lean
+# (proxy: -Xmx32m; orchestrator: -Xmx256m + capped metaspace/code-cache + SerialGC; measured
+# RSS ≈ 170MB for the orchestrator, ~60MB for the proxy) with headroom for the pool connections.
+#
+# The supervisor loop is dash-compatible (Ubuntu's /bin/sh has no `wait -n` — that killed the
+# container at launch once). It exits when EITHER process dies — Render then restarts the
+# container (self-healing). The orchestrator's output is captured to /app/jvm.log so the proxy's
+# visibility beacon can tail it.
+CMD ["sh", "-c", "java -Xmx32m -XX:+UseSerialGC -XX:TieredStopAtLevel=1 -cp /app/proxy-classes PortProxy & BP=$!; java -Xms32m -Xmx256m -XX:MaxMetaspaceSize=128m -XX:ReservedCodeCacheSize=48m -XX:+UseSerialGC -XX:+PerfDisableSharedMem -XX:TieredStopAtLevel=1 -Djava.net.preferIPv4Stack=true -Dfile.encoding=UTF-8 -Djava.awt.headless=true -Duser.timezone=UTC -jar orchestrator.jar > /app/jvm.log 2>&1 & JP=$!; while :; do sleep 5; if ! kill -0 $JP 2>/dev/null; then echo JVM_DIED >> /app/jvm.log; exit 1; fi; if ! kill -0 $BP 2>/dev/null; then echo PROXY_DIED >> /app/jvm.log; exit 1; fi; done"]
