@@ -15,12 +15,14 @@
 # verification), a small straightforward request as `forgeyn-simple` (no review
 # phase — work -> terminal directly once implementation notes exist).
 work_item_schemas:
+  # The project container: lifecycle-free (no roles, no gates of its own —
+  # the gates live on the children). NOTE: every note entry in this config
+  # MUST carry a `role` field (the runtime's parser rejects the whole file
+  # otherwise — the published JSON Schema lags this rule), and a
+  # lifecycle-free item has no phases to gate, so the root declares NO
+  # notes at all; the project's objective rides the root's summary.
   forgeyn-project:
     lifecycle: none
-    notes:
-      - key: objective
-        description: "The project's objective (the first request that created it)"
-        guidance: "One or two lines: what this project is building for the user."
   forgeyn-feature:
     notes:
       - key: requirements
