@@ -8,10 +8,19 @@
 #   Completed   -> role `terminal`, reachable only through the server-enforced gates
 #   Blocked     -> role `blocked` with previousRole preserved (resume returns to it)
 #
-# Two item types keep small requests lightweight (THE LIGHTWEIGHT PATH LAW): a complex request
-# plans as `forgeyn-feature` (full gates incl. verification), a small straightforward request as
-# `forgeyn-simple` (no review phase — work -> terminal directly once implementation notes exist).
+# Three item types keep small requests lightweight (THE LIGHTWEIGHT PATH LAW):
+# a project's container root is `forgeyn-project` (lifecycle-free — no gates of
+# its own; it exists so a scoped credential can anchor the run to exactly one
+# tree), a complex request plans as `forgeyn-feature` (full gates incl.
+# verification), a small straightforward request as `forgeyn-simple` (no review
+# phase — work -> terminal directly once implementation notes exist).
 work_item_schemas:
+  forgeyn-project:
+    lifecycle: none
+    notes:
+      - key: objective
+        description: "The project's objective (the first request that created it)"
+        guidance: "One or two lines: what this project is building for the user."
   forgeyn-feature:
     notes:
       - key: requirements
