@@ -212,7 +212,19 @@ class DatabaseManager(
                 poolName = name
                 maximumPoolSize = maxSize
                 minimumIdle = maxSize
-                connectionTimeout = CHECKOUT_TIMEOUT_MS
+                // THE COLD-START POOL LAW (Forgeyn, 2026-10-25): Hikari's fail-fast init
+                // (initializationFailTimeout >= 0) kills the boot when the FIRST connection
+                // is slower than the checkout budget — on a 0.1-CPU free-tier container the
+                // cold fat-jar JVM's first TLS+SCRAM handshake routinely blows a 2s budget
+                // ("Connection attempt timed out." crash-loop, proven on Render while the
+                // identical single-JVM boot succeeds). -1 = the documented "start the pool
+                // even if the database is briefly unavailable" posture: the boot proceeds,
+                // Flyway's first real checkout retries honestly, and a genuinely dead
+                // database still surfaces as the honest `unavailable` error on first use.
+                initializationFailTimeout = -1
+                // Postgres checkouts keep the upstream-default 30s budget (SQLite's 2s was
+                // tuned for local-file latency; a remote pooler round-trip is not that).
+                connectionTimeout = 30_000L
                 maxLifetime = 0
                 idleTimeout = 0
                 leakDetectionThreshold = LEAK_DETECTION_MS
